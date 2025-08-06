@@ -1,3 +1,6 @@
+STATICS := index.html
+DIST_STATICS = $(addprefix dist/, $(STATICS))
+
 define wasm_bindgen
 	cargo build $(2)
 	wasm-bindgen \
@@ -8,21 +11,22 @@ define wasm_bindgen
 endef
 
 .PHONY: all
-all: dist
+all: build
 
 .PHONY: clean
 clean:
 	rm -rfv dist/
 
-.PHONY: dist
-dist: static
+.PHONY: build
+build: dist $(DIST_STATICS)
 	$(call wasm_bindgen,debug)
 
-.PHONY: release-dist
-release-dist: static
+.PHONY: release-build
+release-build: dist $(DIST_STATICS)
 	$(call wasm_bindgen,release,--release)
 
-.PHONY: static
-static:
+dist:
 	mkdir -p dist
-	cp -v src/index.html dist/
+
+$(DIST_STATICS): dist/%: src/% dist
+	cp -v $< $@
