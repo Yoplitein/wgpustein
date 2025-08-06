@@ -6,15 +6,8 @@
 </head>
 <body>
 	<script type="module">
-		async function main() {
-			const wasm = await WebAssembly.instantiateStreaming(fetch("./wgpustein.wasm"), {
-				"env": {
-					"clog": console.log.bind(console),
-				}
-			});
-			console.log(wasm);
-		}
-		document.addEventListener("DOMContentLoaded", main);
+		import init_wasm from "./wgpustein.js";
+		document.addEventListener("DOMContentLoaded", () => init_wasm());
 	</script>
 </body>
 </html>

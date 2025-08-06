@@ -1,10 +1,14 @@
 #![allow(dead_code, unused_imports, unsafe_op_in_unsafe_fn)]
 
-unsafe extern "C" {
-	fn clog(x: i32);
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+	#[wasm_bindgen(js_namespace = console, js_name = log)]
+	fn clog(str: &str);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn startmepls() {
-	clog(69);
+#[wasm_bindgen(start)]
+fn start() {
+	clog("hello");
 }
