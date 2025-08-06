@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>wgpustein</title>
+</head>
+<body>
+	<script type="module">
+		async function main() {
+			const wasm = await WebAssembly.instantiateStreaming(fetch("./wgpustein.wasm"), {
+				"env": {
+					"clog": console.log.bind(console),
+				}
+			});
+			console.log(wasm);
+		}
+		document.addEventListener("DOMContentLoaded", main);
+	</script>
+</body>
+</html>
