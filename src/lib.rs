@@ -2,13 +2,21 @@
 
 use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen]
-extern "C" {
-	#[wasm_bindgen(js_namespace = console, js_name = log)]
-	fn clog(str: &str);
-}
-
 #[wasm_bindgen(start)]
 fn start() {
-	clog("hello");
+	std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+	console_log::init_with_level(
+		if cfg!(debug_assertions) {
+			log::Level::Trace
+		} else {
+			log::Level::Info
+		}
+	).unwrap();
+
+	log::trace!("trace");
+	log::debug!("debug");
+	log::info!("info");
+	log::warn!("warn");
+	log::error!("error");
+	panic!("panic");
 }
