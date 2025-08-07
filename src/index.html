@@ -3,8 +3,22 @@
 <head>
 	<meta charset="UTF-8">
 	<title>wgpustein</title>
+	<style>
+		body {
+			margin: 0px;
+			background-image: repeating-linear-gradient(to bottom right, #000 0px, #000 5px, #f0f 5px, #f0f 10px);
+			background-size: 100vw 100vh;
+		}
+
+		canvas {
+			width: 100vw;
+			height: 100vh;
+			position: absolute;
+		}
+	</style>
 </head>
 <body>
+	<canvas></canvas>
 	<script type="module">
 		import init_wasm from "./wgpustein.js";
 		document.addEventListener("DOMContentLoaded", () => init_wasm());

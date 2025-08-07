@@ -173,4 +173,5 @@ dependencies = [
  "console_log",
  "log",
  "wasm-bindgen",
+ "web-sys",
 ]
