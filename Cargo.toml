@@ -7,8 +7,16 @@ edition = "2024"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+bevy_app = { version = "0.16.1", features = ["web"] }
+bevy_ecs = "0.16.1"
+bevy_input = { version = "0.16.1", features = ["libm"] }
+bevy_math = { version = "0.16.1", features = ["libm"] }
+bevy_platform = { version = "0.16.1", features = ["web"] }
+bevy_reflect = { version = "0.16.1", features = ["critical-section", "web"] }
+bevy_time = "0.16.1"
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
+inventory = "0.3.20"
 log = { version = "0.4.27", features = ["std", "max_level_trace", "release_max_level_info"] }
 wasm-bindgen = "0.2.100"
 
@@ -22,6 +30,8 @@ features = [
 	"EventTarget",
 	"HtmlCanvasElement",
 	"HtmlElement",
+	"KeyboardEvent",
+	"MouseEvent",
 	"Node",
 	"Window",
 ]
