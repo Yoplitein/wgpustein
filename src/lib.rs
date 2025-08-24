@@ -21,8 +21,11 @@ pub mod prelude {
 	pub use crate::JsResult;
 
 	macro_rules! app_setup_fn {
+		(async $f:ident) => {
+			inventory::submit!($crate::SetupFn::Async($f));
+		};
 		($f:ident) => {
-			inventory::submit!($crate::SetupFn($f));
+			inventory::submit!($crate::SetupFn::Sync($f));
 		};
 	}
 	pub(crate) use app_setup_fn;
@@ -32,7 +35,7 @@ pub mod prelude {
 	}
 }
 
-use std::{cell::OnceCell, rc::Rc, time::Duration};
+use std::{cell::OnceCell, pin::Pin, rc::Rc, time::Duration};
 
 use bevy_app::PluginsState;
 use wasm_bindgen::prelude::*;
@@ -42,7 +45,12 @@ use crate::prelude::*;
 
 pub type JsResult<T = ()> = Result<T, JsValue>;
 
-pub struct SetupFn(fn(&mut App) -> JsResult<()>);
+pub type AsyncSetupResult<'a> = futures_util::future::LocalBoxFuture<'a, JsResult>;
+
+pub enum SetupFn {
+	Sync(fn(&mut App) -> JsResult),
+	Async(for<'a> fn(&'a mut App) -> AsyncSetupResult<'a>),
+}
 inventory::collect!(SetupFn);
 
 pub struct DomElements {
@@ -56,7 +64,7 @@ unsafe extern "C" {
 }
 
 #[wasm_bindgen(start)]
-fn start() -> JsResult {
+async fn start() -> JsResult {
 	unsafe {
 		__wasm_call_ctors();
 	}
@@ -104,8 +112,11 @@ fn start() -> JsResult {
 		},
 	);
 
-	for SetupFn(f) in inventory::iter::<SetupFn> {
-		f(&mut app)?;
+	for f in inventory::iter::<SetupFn> {
+		match f {
+			SetupFn::Sync(f) => f(&mut app)?,
+			SetupFn::Async(f) => f(&mut app).await?,
+		}
 	}
 
 	app.set_runner(|mut app: App| {

@@ -2,8 +2,51 @@ use std::{cell::Cell, f64::consts::PI};
 
 use bevy_app::MainScheduleOrder;
 use bevy_math::DVec2;
-use wasm_bindgen::{JsCast, prelude::Closure};
-use web_sys::CanvasRenderingContext2d;
+use futures_util::FutureExt;
+use js_sys::{Array as JsArray, Object as JsObject};
+use wasm_bindgen::{
+	JsCast,
+	JsValue,
+	prelude::{Closure, wasm_bindgen},
+};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+	Gpu,
+	GpuAdapter,
+	GpuBindGroup,
+	GpuBindGroupDescriptor,
+	GpuBindGroupEntry,
+	GpuBindGroupLayoutDescriptor,
+	GpuBindGroupLayoutEntry,
+	GpuBuffer,
+	GpuBufferBinding,
+	GpuBufferBindingLayout,
+	GpuBufferBindingType,
+	GpuBufferDescriptor,
+	GpuCanvasAlphaMode,
+	GpuCanvasConfiguration,
+	GpuCanvasContext,
+	GpuColorTargetState,
+	GpuDevice,
+	GpuDeviceDescriptor,
+	GpuFragmentState,
+	GpuLoadOp,
+	GpuPipelineLayoutDescriptor,
+	GpuPowerPreference,
+	GpuQueue,
+	GpuRenderPassColorAttachment,
+	GpuRenderPassDescriptor,
+	GpuRenderPipeline,
+	GpuRenderPipelineDescriptor,
+	GpuRequestAdapterOptions,
+	GpuShaderModule,
+	GpuShaderModuleDescriptor,
+	GpuStoreOp,
+	GpuVertexState,
+	gpu_buffer_usage as buffer_usage,
+	gpu_shader_stage as shader_stage,
+	js_sys,
+};
 
 use crate::{DomElements, prelude::*};
 
@@ -17,7 +60,17 @@ pub struct Render;
 pub struct RenderPost;
 
 pub struct GraphicsContext {
-	ctx: CanvasRenderingContext2d,
+	pub gpu: Gpu,
+	pub adapter: GpuAdapter,
+	pub device: GpuDevice,
+	pub queue: GpuQueue,
+	pub context: GpuCanvasContext,
+}
+
+pub struct Pipelines {
+	pub uniforms: GpuBuffer,
+	pub uniforms_group: GpuBindGroup,
+	pub pipeline: GpuRenderPipeline,
 }
 
 #[derive(Clone, Copy, Debug, Event)]
@@ -27,87 +80,222 @@ thread_local! {
 	static PENDING_RESIZE: Cell<Option<UVec2>> = panic!("trying to use PENDING_RESIZE from background thread");
 }
 
-app_setup_fn!(setup);
-fn setup(app: &mut App) -> JsResult {
-	log::info!("setting up graphics context");
-
-	let DomElements { window, canvas, .. } = app.world().non_send_resource::<DomElements>();
-	let ctx = canvas
-		.get_context("2d")?
-		.ok_or("could not get canvas context")?
-		.dyn_into()?;
-	let resize = {
-		let window = window.clone();
-		let canvas = canvas.clone();
-		move || -> JsResult<()> {
-			let size = UVec2::new(
-				window.inner_width()?.as_f64().unwrap() as u32,
-				window.inner_height()?.as_f64().unwrap() as u32,
-			);
-			canvas.set_width(size.x);
-			canvas.set_height(size.y);
-			PENDING_RESIZE.set(Some(size));
-			Ok(())
-		}
-	};
-	let resize = Closure::<dyn Fn() -> JsResult<()>>::new(resize);
-	window.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
-	resize.forget();
-	window.dispatch_event(&web_sys::Event::new("resize")?)?;
-
-	app.insert_non_send_resource(GraphicsContext { ctx });
-
-	app.init_schedule(RenderPre);
-	app.init_schedule(Render);
-	app.init_schedule(RenderPost);
-	let mut order = app.world_mut().resource_mut::<MainScheduleOrder>();
-	order.insert_after(Update, RenderPre);
-	order.insert_after(RenderPre, Render);
-	order.insert_after(Render, RenderPost);
-
-	app.add_event::<WindowResized>();
-
-	app.add_systems(RenderPre, frame_start);
-	app.add_systems(Render, frame);
-
-	Ok(())
+#[wasm_bindgen(inline_js = "export async function sleep(msecs) { const p = \
+                            Promise.withResolvers(); setTimeout(p.resolve, msecs); await \
+                            p.promise; }")]
+extern "C" {
+	async fn sleep(msecs: f64);
 }
 
-fn dispatch_resize(mut resize: EventWriter<WindowResized>, _: NonSend<NonSendMarker>) {
+app_setup_fn!(async setup);
+fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
+	async {
+		log::info!("setting up graphics context");
+
+		let DomElements { window, canvas, .. } = app.world().non_send_resource::<DomElements>();
+		let resize = {
+			let window = window.clone();
+			let canvas = canvas.clone();
+			move || -> JsResult<()> {
+				let size = UVec2::new(
+					window.inner_width()?.as_f64().unwrap() as u32,
+					window.inner_height()?.as_f64().unwrap() as u32,
+				);
+				canvas.set_width(size.x);
+				canvas.set_height(size.y);
+				PENDING_RESIZE.set(Some(size));
+				Ok(())
+			}
+		};
+		let resize = Closure::<dyn Fn() -> JsResult<()>>::new(resize);
+		window.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
+		resize.forget();
+		window.dispatch_event(&web_sys::Event::new("resize")?)?;
+
+		// TODO: error out when WebGPU unsupported
+		let gpu = window.navigator().gpu();
+
+		let mut opt = GpuRequestAdapterOptions::new();
+		opt.set_power_preference(GpuPowerPreference::HighPerformance);
+		let adapter: GpuAdapter = JsFuture::from(gpu.request_adapter_with_options(&opt))
+			.await?
+			.dyn_into()?;
+
+		let device: GpuDevice = JsFuture::from(adapter.request_device()).await?.dyn_into()?;
+		let queue = device.queue();
+
+		let context: GpuCanvasContext = canvas
+			.get_context("webgpu")?
+			.ok_or("could not get canvas context")?
+			.dyn_into()?;
+		let config = GpuCanvasConfiguration::new(&device, gpu.get_preferred_canvas_format());
+		config.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
+		context.configure(&config)?;
+
+		let ctx = GraphicsContext {
+			gpu,
+			adapter,
+			device,
+			queue,
+			context,
+		};
+		app.insert_non_send_resource(setup_pipelines(&ctx).await?);
+		app.insert_non_send_resource(ctx);
+
+		app.init_schedule(RenderPre);
+		app.init_schedule(Render);
+		app.init_schedule(RenderPost);
+		let mut order = app.world_mut().resource_mut::<MainScheduleOrder>();
+		order.insert_after(Update, RenderPre);
+		order.insert_after(RenderPre, Render);
+		order.insert_after(Render, RenderPost);
+
+		app.add_event::<WindowResized>();
+
+		app.add_systems(Update, dispatch_resize);
+		app.add_systems(RenderPre, frame_start);
+		app.add_systems(Render, frame);
+
+		Ok(())
+	}
+	.boxed_local()
+}
+
+async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
+	let uniforms = ctx.device.create_buffer(&GpuBufferDescriptor::new(
+		std::mem::size_of::<f32>() as _,
+		buffer_usage::UNIFORM | buffer_usage::COPY_DST,
+	))?;
+
+	let binding = GpuBufferBindingLayout::new();
+	binding.set_type(GpuBufferBindingType::Uniform);
+	let mut entry = GpuBindGroupLayoutEntry::new(0, shader_stage::VERTEX | shader_stage::FRAGMENT);
+	entry.set_buffer(&binding);
+	let uniforms_layout =
+		ctx.device
+			.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&JsArray::from_iter([
+				entry,
+			])))?;
+	let uniforms_group = ctx.device.create_bind_group(&&GpuBindGroupDescriptor::new(
+		&JsArray::from_iter([&GpuBindGroupEntry::new(
+			0,
+			&GpuBufferBinding::new(&uniforms),
+		)]),
+		&uniforms_layout,
+	));
+
+	let shader_src = r#"
+		const PI: f32 = 3.14159265358979323846264338327950288;
+
+		@group(0)
+		@binding(0)
+		var<uniform> time: f32;
+
+		@vertex
+		fn vertex_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+			switch(index) {
+				case 0: {
+					return vec4f(0.0, 0.5, 0.0, 1.0);
+				}
+				case 1: {
+					return vec4f(-0.5, -0.5, 0.0, 1.0);
+				}
+				case 2: {
+					return vec4f(0.5, -0.5, 0.0, 1.0);
+				}
+				default {
+					return vec4f(0.0, 0.0, 0.0, 1.0);
+				}
+			}
+		}
+
+		@fragment
+		fn fragment_main() -> @location(0) vec4f {
+			return vec4f(cos(time * 0.9 * 2.0 * PI), sin(time * 2.0 * PI), cos(time * 0.8 * 2.0 * PI), 1.0);
+		}
+	"#;
+	let shader_module = ctx
+		.device
+		.create_shader_module(&GpuShaderModuleDescriptor::new(shader_src));
+
+	let pipeline_layout = ctx
+		.device
+		.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&JsArray::from_iter([
+			&uniforms_layout,
+		])));
+
+	let mut vertex_state = GpuVertexState::new(&shader_module);
+	vertex_state.set_entry_point("vertex_main");
+	let mut fragment_state = GpuFragmentState::new(
+		&shader_module,
+		&JsArray::from_iter([&GpuColorTargetState::new(
+			ctx.gpu.get_preferred_canvas_format(),
+		)]),
+	);
+	fragment_state.set_entry_point("fragment_main");
+	let mut pipeline_desc = GpuRenderPipelineDescriptor::new(&pipeline_layout, &vertex_state);
+	pipeline_desc.set_fragment(&fragment_state);
+	let pipeline = ctx.device.create_render_pipeline(&pipeline_desc)?;
+
+	Ok(Pipelines {
+		uniforms,
+		uniforms_group,
+		pipeline,
+	})
+}
+
+fn dispatch_resize(mut resize: EventWriter<WindowResized>, _: Option<NonSend<NonSendMarker>>) {
 	let Some(new_size) = PENDING_RESIZE.take() else {
 		return;
 	};
 	log::trace!("resizing to {new_size}");
 	resize.write(WindowResized(new_size));
-
-	// TODO: resize framebuffer?
 }
 
-fn frame_start(ctx: NonSend<GraphicsContext>) {
-	let ctx = &ctx.ctx;
-	ctx.set_fill_style_str("black");
-	let (width, height) = {
-		let canvas = ctx.canvas().unwrap();
-		(canvas.width() as f64, canvas.height() as f64)
-	};
-	ctx.fill_rect(0.0, 0.0, width, height);
+fn frame_start(
+	ctx: NonSend<GraphicsContext>,
+	pipelines: NonSend<Pipelines>,
+	time: Res<Time<Virtual>>,
+) {
+	ctx.queue
+		.write_buffer_with_u32_and_u8_slice(
+			&pipelines.uniforms,
+			0,
+			&time.elapsed_secs().to_ne_bytes(),
+		)
+		.expect("could not write uniforms buffer");
 }
 
-fn frame(ctx: NonSend<GraphicsContext>, time: Res<Time<Virtual>>) {
-	let ctx = &ctx.ctx;
-	let (width, height) = {
-		let canvas = ctx.canvas().unwrap();
-		(canvas.width() as f64, canvas.height() as f64)
-	};
-	let size = DVec2::new(width, height);
-	let half_size = size / 2.0;
+fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res<Time<Virtual>>) {
+	let canvas_texture = ctx
+		.context
+		.get_current_texture()
+		.expect("couldn't get canvas texture");
+	let texture_view = canvas_texture
+		.create_view()
+		.expect("couldn't get canvas texture view");
 
-	ctx.set_stroke_style_str("white");
-	ctx.begin_path();
-	let dist = size.min_element() * 0.95 / 2.0;
-	let (x, y) =
-		(DVec2::from_angle(time.elapsed_secs_f64() * 2.0 * PI * 0.25) * dist + half_size).into();
-	ctx.move_to(half_size.x, half_size.y);
-	ctx.line_to(x, y);
-	ctx.stroke();
+	let encoder = ctx.device.create_command_encoder();
+
+	let mut attachment =
+		GpuRenderPassColorAttachment::new(GpuLoadOp::Clear, GpuStoreOp::Store, &texture_view);
+	attachment.set_clear_value(
+		&[0.0, 1.0, 1.0, 1.0]
+			.into_iter()
+			.map(JsValue::from)
+			.collect::<JsArray>(),
+	);
+	let attachments = JsArray::from_iter([&attachment]);
+	let pass_encoder = encoder
+		.begin_render_pass(&GpuRenderPassDescriptor::new(&attachments))
+		.expect("couldn't begin render pass");
+	pass_encoder.set_bind_group(0, Some(&pipelines.uniforms_group));
+	pass_encoder.set_pipeline(&pipelines.pipeline);
+	pass_encoder.draw(3);
+	pass_encoder.end();
+
+	let command_buffer = encoder.finish();
+	ctx.device
+		.queue()
+		.submit(&JsArray::from_iter([&command_buffer]));
 }
