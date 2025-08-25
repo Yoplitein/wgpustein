@@ -42,7 +42,11 @@ use web_sys::{
 	GpuShaderModule,
 	GpuShaderModuleDescriptor,
 	GpuStoreOp,
+	GpuVertexAttribute,
+	GpuVertexBufferLayout,
+	GpuVertexFormat,
 	GpuVertexState,
+	GpuVertexStepMode,
 	gpu_buffer_usage as buffer_usage,
 	gpu_shader_stage as shader_stage,
 	js_sys,
@@ -70,6 +74,9 @@ pub struct GraphicsContext {
 pub struct Pipelines {
 	pub uniforms: GpuBuffer,
 	pub uniforms_group: GpuBindGroup,
+
+	pub instances: GpuBuffer,
+
 	pub pipeline: GpuRenderPipeline,
 }
 
@@ -126,7 +133,7 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 
 		let context: GpuCanvasContext = canvas
 			.get_context("webgpu")?
-			.ok_or("could not get canvas context")?
+			.ok_or("couldn't get canvas context")?
 			.dyn_into()?;
 		let config = GpuCanvasConfiguration::new(&device, gpu.get_preferred_canvas_format());
 		config.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
@@ -163,7 +170,7 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 
 async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 	let uniforms = ctx.device.create_buffer(&GpuBufferDescriptor::new(
-		std::mem::size_of::<f32>() as _,
+		size_of::<f32>() as _,
 		buffer_usage::UNIFORM | buffer_usage::COPY_DST,
 	))?;
 
@@ -176,7 +183,7 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 			.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&JsArray::from_iter([
 				entry,
 			])))?;
-	let uniforms_group = ctx.device.create_bind_group(&&GpuBindGroupDescriptor::new(
+	let uniforms_group = ctx.device.create_bind_group(&GpuBindGroupDescriptor::new(
 		&JsArray::from_iter([&GpuBindGroupEntry::new(
 			0,
 			&GpuBufferBinding::new(&uniforms),
@@ -184,36 +191,21 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 		&uniforms_layout,
 	));
 
-	let shader_src = r#"
-		const PI: f32 = 3.14159265358979323846264338327950288;
+	let instances = create_instances_buffer(&ctx, 4); // FIXME: initially 0
+	// DEBUG
+	let instances_bytes = [
+		vec4(-0.5, 0.5, 0.0, 0.0),
+		vec4(0.5, 0.5, 0.0, 0.0),
+		vec4(-0.5, -0.5, 0.0, 0.0),
+		vec4(0.5, -0.5, 0.0, 0.0),
+	];
+	let instances_bytes = instances_bytes.map(|v| v.to_array().map(f32::to_ne_bytes));
+	let instances_bytes = instances_bytes.as_flattened().as_flattened(); // : ^ )
+	ctx.queue
+		.write_buffer_with_u32_and_u8_slice(&instances, 0, instances_bytes)
+		.expect("couldn't write instances buffer");
 
-		@group(0)
-		@binding(0)
-		var<uniform> time: f32;
-
-		@vertex
-		fn vertex_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
-			switch(index) {
-				case 0: {
-					return vec4f(0.0, 0.5, 0.0, 1.0);
-				}
-				case 1: {
-					return vec4f(-0.5, -0.5, 0.0, 1.0);
-				}
-				case 2: {
-					return vec4f(0.5, -0.5, 0.0, 1.0);
-				}
-				default {
-					return vec4f(0.0, 0.0, 0.0, 1.0);
-				}
-			}
-		}
-
-		@fragment
-		fn fragment_main() -> @location(0) vec4f {
-			return vec4f(cos(time * 0.9 * 2.0 * PI), sin(time * 2.0 * PI), cos(time * 0.8 * 2.0 * PI), 1.0);
-		}
-	"#;
+	let shader_src = include_str!("shaders/quad.wgsl");
 	let shader_module = ctx
 		.device
 		.create_shader_module(&GpuShaderModuleDescriptor::new(shader_src));
@@ -226,6 +218,13 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 
 	let mut vertex_state = GpuVertexState::new(&shader_module);
 	vertex_state.set_entry_point("vertex_main");
+	let mut buffer_layout = GpuVertexBufferLayout::new(
+		size_of::<[f32; 4]>() as _,
+		&JsArray::from_iter([&GpuVertexAttribute::new(GpuVertexFormat::Float32x4, 0.0, 0)]),
+	);
+	buffer_layout.set_step_mode(GpuVertexStepMode::Instance);
+	let buffers = JsArray::from_iter([&buffer_layout]);
+	vertex_state.set_buffers(&buffers);
 	let mut fragment_state = GpuFragmentState::new(
 		&shader_module,
 		&JsArray::from_iter([&GpuColorTargetState::new(
@@ -240,8 +239,20 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 	Ok(Pipelines {
 		uniforms,
 		uniforms_group,
+		instances,
 		pipeline,
 	})
+}
+
+fn create_instances_buffer(ctx: &GraphicsContext, length: usize) -> GpuBuffer {
+	let buffer = ctx
+		.device
+		.create_buffer(&GpuBufferDescriptor::new(
+			(size_of::<[f32; 4]>() * length) as _,
+			buffer_usage::VERTEX | buffer_usage::COPY_DST,
+		))
+		.expect("couldn't allocate instances buffer");
+	buffer
 }
 
 fn dispatch_resize(mut resize: EventWriter<WindowResized>, _: Option<NonSend<NonSendMarker>>) {
@@ -263,7 +274,7 @@ fn frame_start(
 			0,
 			&time.elapsed_secs().to_ne_bytes(),
 		)
-		.expect("could not write uniforms buffer");
+		.expect("couldn't write uniforms buffer");
 }
 
 fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res<Time<Virtual>>) {
@@ -289,9 +300,10 @@ fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res
 	let pass_encoder = encoder
 		.begin_render_pass(&GpuRenderPassDescriptor::new(&attachments))
 		.expect("couldn't begin render pass");
-	pass_encoder.set_bind_group(0, Some(&pipelines.uniforms_group));
 	pass_encoder.set_pipeline(&pipelines.pipeline);
-	pass_encoder.draw(3);
+	pass_encoder.set_vertex_buffer(0, Some(&pipelines.instances));
+	pass_encoder.set_bind_group(0, Some(&pipelines.uniforms_group));
+	pass_encoder.draw_with_instance_count(3, 4); // FIXME: instance count
 	pass_encoder.end();
 
 	let command_buffer = encoder.finish();
