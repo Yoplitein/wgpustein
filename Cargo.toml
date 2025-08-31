@@ -14,6 +14,7 @@ bevy_math = { version = "0.16.1", features = ["libm"] }
 bevy_platform = { version = "0.16.1", features = ["web"] }
 bevy_reflect = { version = "0.16.1", features = ["critical-section", "web"] }
 bevy_time = "0.16.1"
+bytemuck = "1.23.2"
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 futures-util = "0.3.31"

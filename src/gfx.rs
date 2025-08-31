@@ -144,18 +144,31 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 	.boxed_local()
 }
 
+fn matrix_bytes(mat: &Mat4) -> &[u8] {
+	let slice = mat.as_ref();
+	bytemuck::cast_slice(slice)
+}
+
 async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 	let uniforms = ctx.device.create_buffer(&wgpu::BufferDescriptor {
 		label: Some("uniforms"),
-		size: size_of::<f32>() as _,
+		size: size_of::<[f32; 4 * 4 * 2 + 1 + 3]>() as _,
 		usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
 		mapped_at_creation: false,
 	});
 
+	// TODO: camera handling
+	let view_mat = bevy_math::Mat4::look_at_rh(
+		Vec3::new(2.5, 2.5, 0.5),
+		Vec3::ZERO,
+		Vec3::Z,
+	);
+	ctx.queue.write_buffer(&uniforms, size_of::<[f32; 4 * 4]>() as _, matrix_bytes(&view_mat));
+
 	let uniforms_layout = ctx
 		.device
 		.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-			label: None,
+			label: Some("uniforms layout"),
 			entries: &[wgpu::BindGroupLayoutEntry {
 				binding: 0,
 				count: None,
@@ -168,7 +181,7 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 			}],
 		});
 	let uniforms_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-		label: None,
+		label: Some("uniforms group"),
 		layout: &uniforms_layout,
 		entries: &[wgpu::BindGroupEntry {
 			binding: 0,
@@ -182,14 +195,14 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 
 	let instances = create_instances_buffer(ctx, 4);
 	// DEBUG
-	let instances_bytes = [
-		vec4(-0.5, 0.5, 0.0, 0.0),
-		vec4(0.5, 0.5, 0.0, 0.0),
-		vec4(-0.5, -0.5, 0.0, 0.0),
-		vec4(0.5, -0.5, 0.0, 0.0),
+	let instances_data = [
+		vec4(1.0, 1.0, 0.0, 0.0),
+		vec4(-1.0, 1.0, 0.0, 0.0),
+		vec4(1.0, 2.5, 0.0, 0.0),
+		vec4(-1.0, 2.5, 0.0, 0.0),
 	];
-	let instances_bytes = instances_bytes.map(|v| v.to_array().map(f32::to_ne_bytes));
-	let instances_bytes = instances_bytes.as_flattened().as_flattened(); // : ^ )
+	let instances_bytes = instances_data.map(|v| v.to_array());
+	let instances_bytes = bytemuck::cast_slice(&instances_bytes);
 	ctx.queue.write_buffer(&instances, 0, instances_bytes);
 
 	let shader_src = include_str!("shaders/quad.wgsl");
@@ -216,7 +229,10 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 			multisample: wgpu::MultisampleState::default(),
 			multiview: None,
 			cache: None,
-			primitive: wgpu::PrimitiveState::default(),
+			primitive: wgpu::PrimitiveState {
+				topology: wgpu::PrimitiveTopology::TriangleStrip,
+				..default()
+			},
 			vertex: wgpu::VertexState {
 				module: &shader_module,
 				compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -274,7 +290,7 @@ fn frame_start(
 	mut resizes: EventReader<WindowResized>,
 ) {
 	ctx.queue
-		.write_buffer(&pipelines.uniforms, 0, &time.elapsed_secs().to_ne_bytes());
+		.write_buffer(&pipelines.uniforms, size_of::<[f32; 4 * 4 * 2]>() as _, &time.elapsed_secs().to_ne_bytes());
 
 	if let Some(&WindowResized(size)) = resizes.read().next() {
 		let surface_config = ctx
@@ -282,6 +298,16 @@ fn frame_start(
 			.get_default_config(&ctx.adapter, size.x, size.y)
 			.expect("couldn't get surface config");
 		ctx.surface.configure(&ctx.device, &surface_config);
+
+		let aspect = size.x as f32 / size.y as f32;
+		let fov = 120f32.to_radians() / aspect;
+		let projection = Mat4::perspective_rh(
+			fov,
+			aspect,
+			0.01,
+			1000.0,
+		);
+		ctx.queue.write_buffer(&pipelines.uniforms, 0, matrix_bytes(&projection));
 	}
 }
 
@@ -313,7 +339,7 @@ fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res
 	pass.set_pipeline(&pipelines.pipeline);
 	pass.set_vertex_buffer(0, pipelines.instances.slice(..));
 	pass.set_bind_group(0, &pipelines.uniforms_group, &[]);
-	pass.draw(0 .. 3, 0 .. 4);
+	pass.draw(0 .. 4, 0 .. 4);
 	drop(pass);
 
 	ctx.queue.submit([encoder.finish()]);
