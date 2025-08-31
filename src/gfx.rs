@@ -1,4 +1,4 @@
-use std::{cell::Cell, f64::consts::PI};
+use std::{borrow::Cow, cell::Cell, f64::consts::PI, num::NonZero, ptr::NonNull};
 
 use bevy_app::MainScheduleOrder;
 use bevy_math::DVec2;
@@ -6,50 +6,21 @@ use futures_util::FutureExt;
 use js_sys::{Array as JsArray, Object as JsObject};
 use wasm_bindgen::{
 	JsCast,
+	JsError,
 	JsValue,
 	prelude::{Closure, wasm_bindgen},
 };
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-	Gpu,
-	GpuAdapter,
-	GpuBindGroup,
-	GpuBindGroupDescriptor,
-	GpuBindGroupEntry,
-	GpuBindGroupLayoutDescriptor,
-	GpuBindGroupLayoutEntry,
-	GpuBuffer,
-	GpuBufferBinding,
-	GpuBufferBindingLayout,
-	GpuBufferBindingType,
-	GpuBufferDescriptor,
-	GpuCanvasAlphaMode,
-	GpuCanvasConfiguration,
-	GpuCanvasContext,
-	GpuColorTargetState,
-	GpuDevice,
-	GpuDeviceDescriptor,
-	GpuFragmentState,
-	GpuLoadOp,
-	GpuPipelineLayoutDescriptor,
-	GpuPowerPreference,
-	GpuQueue,
-	GpuRenderPassColorAttachment,
-	GpuRenderPassDescriptor,
-	GpuRenderPipeline,
-	GpuRenderPipelineDescriptor,
-	GpuRequestAdapterOptions,
-	GpuShaderModule,
-	GpuShaderModuleDescriptor,
-	GpuStoreOp,
-	GpuVertexAttribute,
-	GpuVertexBufferLayout,
-	GpuVertexFormat,
-	GpuVertexState,
-	GpuVertexStepMode,
-	gpu_buffer_usage as buffer_usage,
-	gpu_shader_stage as shader_stage,
-	js_sys,
+use wgpu::{
+	BufferUsages,
+	ShaderStages,
+	rwh::{
+		RawDisplayHandle,
+		RawWindowHandle,
+		WebCanvasWindowHandle,
+		WebDisplayHandle,
+		WebWindowHandle,
+	},
 };
 
 use crate::{DomElements, prelude::*};
@@ -64,34 +35,28 @@ pub struct Render;
 pub struct RenderPost;
 
 pub struct GraphicsContext {
-	pub gpu: Gpu,
-	pub adapter: GpuAdapter,
-	pub device: GpuDevice,
-	pub queue: GpuQueue,
-	pub context: GpuCanvasContext,
+	pub instance: wgpu::Instance,
+	pub surface: wgpu::Surface<'static>,
+	pub adapter: wgpu::Adapter,
+	pub device: wgpu::Device,
+	pub queue: wgpu::Queue,
 }
 
 pub struct Pipelines {
-	pub uniforms: GpuBuffer,
-	pub uniforms_group: GpuBindGroup,
+	pub uniforms: wgpu::Buffer,
+	pub uniforms_group: wgpu::BindGroup,
 
-	pub instances: GpuBuffer,
+	pub instances: wgpu::Buffer,
 
-	pub pipeline: GpuRenderPipeline,
+	pub pipeline: wgpu::RenderPipeline,
 }
 
 #[derive(Clone, Copy, Debug, Event)]
 pub struct WindowResized(pub UVec2);
 
 thread_local! {
-	static PENDING_RESIZE: Cell<Option<UVec2>> = panic!("trying to use PENDING_RESIZE from background thread");
-}
-
-#[wasm_bindgen(inline_js = "export async function sleep(msecs) { const p = \
-                            Promise.withResolvers(); setTimeout(p.resolve, msecs); await \
-                            p.promise; }")]
-extern "C" {
-	async fn sleep(msecs: f64);
+	static PENDING_RESIZE: Cell<Option<UVec2>> =
+		panic!("trying to use PENDING_RESIZE from background thread");
 }
 
 app_setup_fn!(async setup);
@@ -119,32 +84,43 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 		resize.forget();
 		window.dispatch_event(&web_sys::Event::new("resize")?)?;
 
-		// TODO: error out when WebGPU unsupported
-		let gpu = window.navigator().gpu();
+		let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+			backends: wgpu::Backends::BROWSER_WEBGPU,
+			..default()
+		});
 
-		let mut opt = GpuRequestAdapterOptions::new();
-		opt.set_power_preference(GpuPowerPreference::HighPerformance);
-		let adapter: GpuAdapter = JsFuture::from(gpu.request_adapter_with_options(&opt))
-			.await?
-			.dyn_into()?;
+		let handle = WebCanvasWindowHandle::new(NonNull::from(canvas).cast());
+		let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+			raw_display_handle: RawDisplayHandle::Web(WebDisplayHandle::new()),
+			raw_window_handle: RawWindowHandle::WebCanvas(handle),
+		};
+		let surface = unsafe { instance.create_surface_unsafe(target) }.map_err(JsError::from)?;
 
-		let device: GpuDevice = JsFuture::from(adapter.request_device()).await?.dyn_into()?;
-		let queue = device.queue();
+		let adapter = instance
+			.request_adapter(&wgpu::RequestAdapterOptions {
+				power_preference: wgpu::PowerPreference::HighPerformance,
+				compatible_surface: Some(&surface),
+				..default()
+			})
+			.await
+			.map_err(JsError::from)?;
 
-		let context: GpuCanvasContext = canvas
-			.get_context("webgpu")?
-			.ok_or("couldn't get canvas context")?
-			.dyn_into()?;
-		let config = GpuCanvasConfiguration::new(&device, gpu.get_preferred_canvas_format());
-		config.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
-		context.configure(&config)?;
+		let (device, queue) = adapter
+			.request_device(&wgpu::DeviceDescriptor {
+				required_features: wgpu::Features::empty(),
+				required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+					.using_resolution(adapter.limits()),
+				..default()
+			})
+			.await
+			.map_err(JsError::from)?;
 
 		let ctx = GraphicsContext {
-			gpu,
+			instance,
+			surface,
 			adapter,
 			device,
 			queue,
-			context,
 		};
 		app.insert_non_send_resource(setup_pipelines(&ctx).await?);
 		app.insert_non_send_resource(ctx);
@@ -169,29 +145,42 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 }
 
 async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
-	let uniforms = ctx.device.create_buffer(&GpuBufferDescriptor::new(
-		size_of::<f32>() as _,
-		buffer_usage::UNIFORM | buffer_usage::COPY_DST,
-	))?;
+	let uniforms = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+		label: Some("uniforms"),
+		size: size_of::<f32>() as _,
+		usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+		mapped_at_creation: false,
+	});
 
-	let binding = GpuBufferBindingLayout::new();
-	binding.set_type(GpuBufferBindingType::Uniform);
-	let mut entry = GpuBindGroupLayoutEntry::new(0, shader_stage::VERTEX | shader_stage::FRAGMENT);
-	entry.set_buffer(&binding);
-	let uniforms_layout =
-		ctx.device
-			.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&JsArray::from_iter([
-				entry,
-			])))?;
-	let uniforms_group = ctx.device.create_bind_group(&GpuBindGroupDescriptor::new(
-		&JsArray::from_iter([&GpuBindGroupEntry::new(
-			0,
-			&GpuBufferBinding::new(&uniforms),
-		)]),
-		&uniforms_layout,
-	));
+	let uniforms_layout = ctx
+		.device
+		.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+			label: None,
+			entries: &[wgpu::BindGroupLayoutEntry {
+				binding: 0,
+				count: None,
+				visibility: ShaderStages::VERTEX_FRAGMENT,
+				ty: wgpu::BindingType::Buffer {
+					ty: wgpu::BufferBindingType::Uniform,
+					has_dynamic_offset: false,
+					min_binding_size: Some(NonZero::new(uniforms.size()).unwrap()),
+				},
+			}],
+		});
+	let uniforms_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+		label: None,
+		layout: &uniforms_layout,
+		entries: &[wgpu::BindGroupEntry {
+			binding: 0,
+			resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+				buffer: &uniforms,
+				offset: 0,
+				size: None,
+			}),
+		}],
+	});
 
-	let instances = create_instances_buffer(&ctx, 4); // FIXME: initially 0
+	let instances = create_instances_buffer(ctx, 4);
 	// DEBUG
 	let instances_bytes = [
 		vec4(-0.5, 0.5, 0.0, 0.0),
@@ -201,40 +190,56 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 	];
 	let instances_bytes = instances_bytes.map(|v| v.to_array().map(f32::to_ne_bytes));
 	let instances_bytes = instances_bytes.as_flattened().as_flattened(); // : ^ )
-	ctx.queue
-		.write_buffer_with_u32_and_u8_slice(&instances, 0, instances_bytes)
-		.expect("couldn't write instances buffer");
+	ctx.queue.write_buffer(&instances, 0, instances_bytes);
 
 	let shader_src = include_str!("shaders/quad.wgsl");
 	let shader_module = ctx
 		.device
-		.create_shader_module(&GpuShaderModuleDescriptor::new(shader_src));
+		.create_shader_module(wgpu::ShaderModuleDescriptor {
+			label: None,
+			source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_src)),
+		});
 
 	let pipeline_layout = ctx
 		.device
-		.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&JsArray::from_iter([
-			&uniforms_layout,
-		])));
-
-	let mut vertex_state = GpuVertexState::new(&shader_module);
-	vertex_state.set_entry_point("vertex_main");
-	let mut buffer_layout = GpuVertexBufferLayout::new(
-		size_of::<[f32; 4]>() as _,
-		&JsArray::from_iter([&GpuVertexAttribute::new(GpuVertexFormat::Float32x4, 0.0, 0)]),
-	);
-	buffer_layout.set_step_mode(GpuVertexStepMode::Instance);
-	let buffers = JsArray::from_iter([&buffer_layout]);
-	vertex_state.set_buffers(&buffers);
-	let mut fragment_state = GpuFragmentState::new(
-		&shader_module,
-		&JsArray::from_iter([&GpuColorTargetState::new(
-			ctx.gpu.get_preferred_canvas_format(),
-		)]),
-	);
-	fragment_state.set_entry_point("fragment_main");
-	let mut pipeline_desc = GpuRenderPipelineDescriptor::new(&pipeline_layout, &vertex_state);
-	pipeline_desc.set_fragment(&fragment_state);
-	let pipeline = ctx.device.create_render_pipeline(&pipeline_desc)?;
+		.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+			label: None,
+			bind_group_layouts: &[&uniforms_layout],
+			push_constant_ranges: &[],
+		});
+	let pipeline = ctx
+		.device
+		.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+			label: None,
+			layout: Some(&pipeline_layout),
+			depth_stencil: None,
+			multisample: wgpu::MultisampleState::default(),
+			multiview: None,
+			cache: None,
+			primitive: wgpu::PrimitiveState::default(),
+			vertex: wgpu::VertexState {
+				module: &shader_module,
+				compilation_options: wgpu::PipelineCompilationOptions::default(),
+				entry_point: None,
+				buffers: &[wgpu::VertexBufferLayout {
+					step_mode: wgpu::VertexStepMode::Instance,
+					array_stride: size_of::<[f32; 4]>() as _,
+					attributes: &[wgpu::VertexAttribute {
+						shader_location: 0,
+						offset: 0,
+						format: wgpu::VertexFormat::Float32x4,
+					}],
+				}],
+			},
+			fragment: Some(wgpu::FragmentState {
+				module: &shader_module,
+				compilation_options: wgpu::PipelineCompilationOptions::default(),
+				entry_point: None,
+				targets: &[Some(
+					ctx.surface.get_capabilities(&ctx.adapter).formats[0].into(),
+				)],
+			}),
+		});
 
 	Ok(Pipelines {
 		uniforms,
@@ -244,14 +249,13 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 	})
 }
 
-fn create_instances_buffer(ctx: &GraphicsContext, length: usize) -> GpuBuffer {
-	let buffer = ctx
-		.device
-		.create_buffer(&GpuBufferDescriptor::new(
-			(size_of::<[f32; 4]>() * length) as _,
-			buffer_usage::VERTEX | buffer_usage::COPY_DST,
-		))
-		.expect("couldn't allocate instances buffer");
+fn create_instances_buffer(ctx: &GraphicsContext, length: usize) -> wgpu::Buffer {
+	let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+		label: Some("instances"),
+		size: (size_of::<[f32; 4]>() * length) as _,
+		usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+		mapped_at_creation: false,
+	});
 	buffer
 }
 
@@ -267,47 +271,51 @@ fn frame_start(
 	ctx: NonSend<GraphicsContext>,
 	pipelines: NonSend<Pipelines>,
 	time: Res<Time<Virtual>>,
+	mut resizes: EventReader<WindowResized>,
 ) {
 	ctx.queue
-		.write_buffer_with_u32_and_u8_slice(
-			&pipelines.uniforms,
-			0,
-			&time.elapsed_secs().to_ne_bytes(),
-		)
-		.expect("couldn't write uniforms buffer");
+		.write_buffer(&pipelines.uniforms, 0, &time.elapsed_secs().to_ne_bytes());
+
+	if let Some(&WindowResized(size)) = resizes.read().next() {
+		let surface_config = ctx
+			.surface
+			.get_default_config(&ctx.adapter, size.x, size.y)
+			.expect("couldn't get surface config");
+		ctx.surface.configure(&ctx.device, &surface_config);
+	}
 }
 
 fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res<Time<Virtual>>) {
 	let canvas_texture = ctx
-		.context
+		.surface
 		.get_current_texture()
 		.expect("couldn't get canvas texture");
 	let texture_view = canvas_texture
-		.create_view()
-		.expect("couldn't get canvas texture view");
+		.texture
+		.create_view(&wgpu::TextureViewDescriptor::default());
 
-	let encoder = ctx.device.create_command_encoder();
+	let mut encoder = ctx
+		.device
+		.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-	let mut attachment =
-		GpuRenderPassColorAttachment::new(GpuLoadOp::Clear, GpuStoreOp::Store, &texture_view);
-	attachment.set_clear_value(
-		&[0.0, 1.0, 1.0, 1.0]
-			.into_iter()
-			.map(JsValue::from)
-			.collect::<JsArray>(),
-	);
-	let attachments = JsArray::from_iter([&attachment]);
-	let pass_encoder = encoder
-		.begin_render_pass(&GpuRenderPassDescriptor::new(&attachments))
-		.expect("couldn't begin render pass");
-	pass_encoder.set_pipeline(&pipelines.pipeline);
-	pass_encoder.set_vertex_buffer(0, Some(&pipelines.instances));
-	pass_encoder.set_bind_group(0, Some(&pipelines.uniforms_group));
-	pass_encoder.draw_with_instance_count(3, 4); // FIXME: instance count
-	pass_encoder.end();
+	let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+		color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+			view: &texture_view,
+			depth_slice: None,
+			resolve_target: None,
+			ops: wgpu::Operations {
+				load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+				store: wgpu::StoreOp::Store,
+			},
+		})],
+		..default()
+	});
+	pass.set_pipeline(&pipelines.pipeline);
+	pass.set_vertex_buffer(0, pipelines.instances.slice(..));
+	pass.set_bind_group(0, &pipelines.uniforms_group, &[]);
+	pass.draw(0 .. 3, 0 .. 4);
+	drop(pass);
 
-	let command_buffer = encoder.finish();
-	ctx.device
-		.queue()
-		.submit(&JsArray::from_iter([&command_buffer]));
+	ctx.queue.submit([encoder.finish()]);
+	canvas_texture.present();
 }
