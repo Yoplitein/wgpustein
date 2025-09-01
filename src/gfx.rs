@@ -23,7 +23,7 @@ use wgpu::{
 	},
 };
 
-use crate::{DomElements, prelude::*};
+use crate::{DomElements, prelude::*, transform::Transform};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ScheduleLabel)]
 pub struct RenderPre;
@@ -53,6 +53,9 @@ pub struct Pipelines {
 
 #[derive(Clone, Copy, Debug, Event)]
 pub struct WindowResized(pub UVec2);
+
+#[derive(Clone, Copy, Debug, Component)]
+pub struct Camera;
 
 thread_local! {
 	static PENDING_RESIZE: Cell<Option<UVec2>> =
@@ -156,14 +159,6 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 		usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
 		mapped_at_creation: false,
 	});
-
-	// TODO: camera handling
-	let view_mat = bevy_math::Mat4::look_at_rh(
-		Vec3::new(2.5, 2.5, 0.5),
-		Vec3::ZERO,
-		Vec3::Z,
-	);
-	ctx.queue.write_buffer(&uniforms, size_of::<[f32; 4 * 4]>() as _, matrix_bytes(&view_mat));
 
 	let uniforms_layout = ctx
 		.device
@@ -288,9 +283,13 @@ fn frame_start(
 	pipelines: NonSend<Pipelines>,
 	time: Res<Time<Virtual>>,
 	mut resizes: EventReader<WindowResized>,
+	camera: Query<&Transform, (With<Camera>, Changed<Transform>)>,
 ) {
-	ctx.queue
-		.write_buffer(&pipelines.uniforms, size_of::<[f32; 4 * 4 * 2]>() as _, &time.elapsed_secs().to_ne_bytes());
+	ctx.queue.write_buffer(
+		&pipelines.uniforms,
+		size_of::<[f32; 4 * 4 * 2]>() as _,
+		&time.elapsed_secs().to_ne_bytes(),
+	);
 
 	if let Some(&WindowResized(size)) = resizes.read().next() {
 		let surface_config = ctx
@@ -300,14 +299,20 @@ fn frame_start(
 		ctx.surface.configure(&ctx.device, &surface_config);
 
 		let aspect = size.x as f32 / size.y as f32;
+		// TODO: configurable FOV
 		let fov = 120f32.to_radians() / aspect;
-		let projection = Mat4::perspective_rh(
-			fov,
-			aspect,
-			0.01,
-			1000.0,
+		let projection = Mat4::perspective_rh(fov, aspect, 0.01, 1000.0);
+		ctx.queue
+			.write_buffer(&pipelines.uniforms, 0, matrix_bytes(&projection));
+	}
+
+	if let Ok(transform) = camera.single() {
+		let view_mat = transform.as_view_matrix();
+		ctx.queue.write_buffer(
+			&pipelines.uniforms,
+			size_of::<[f32; 4 * 4]>() as _,
+			matrix_bytes(&view_mat),
 		);
-		ctx.queue.write_buffer(&pipelines.uniforms, 0, matrix_bytes(&projection));
 	}
 }
 

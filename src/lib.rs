@@ -6,10 +6,12 @@
 	unused_mut
 )]
 
+pub mod entities;
 #[cfg(debug_assertions)]
 pub mod fps_counter;
 pub mod gfx;
 pub mod input;
+pub mod transform;
 
 pub mod prelude {
 	pub use bevy_app::prelude::*;
