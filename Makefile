@@ -30,3 +30,7 @@ dist:
 
 $(DIST_STATICS): dist/%: src/% dist
 	cp -v $< $@
+
+.PHONY: test
+test:
+	cargo test --target=$(shell rustc -vV | grep host | cut -d' ' -f2)
