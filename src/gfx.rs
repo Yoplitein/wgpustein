@@ -43,6 +43,8 @@ pub struct GraphicsContext {
 }
 
 pub struct Pipelines {
+	pub depth_texture: wgpu::Texture,
+
 	pub uniforms: wgpu::Buffer,
 	pub uniforms_group: wgpu::BindGroup,
 
@@ -195,6 +197,17 @@ fn matrix_bytes(mat: &Mat4) -> &[u8] {
 }
 
 async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
+	let depth_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+		label: Some("initial depth texture"),
+		size: default(),
+		mip_level_count: 1,
+		sample_count: 1,
+		dimension: wgpu::TextureDimension::D2,
+		format: wgpu::TextureFormat::Depth24Plus,
+		usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+		view_formats: &[],
+	});
+
 	let uniforms = ctx.device.create_buffer(&wgpu::BufferDescriptor {
 		label: Some("uniforms"),
 		size: size_of::<[f32; 4 * 4 * 2 + 1 + 3]>() as _,
@@ -252,7 +265,13 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 		.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
 			label: Some("quad render pipeline"),
 			layout: Some(&pipeline_layout),
-			depth_stencil: None,
+			depth_stencil: Some(wgpu::DepthStencilState {
+				format: wgpu::TextureFormat::Depth24Plus,
+				depth_write_enabled: true,
+				depth_compare: wgpu::CompareFunction::LessEqual,
+				stencil: default(),
+				bias: default(),
+			}),
 			multisample: wgpu::MultisampleState::default(),
 			multiview: None,
 			cache: None,
@@ -308,9 +327,13 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 		});
 
 	Ok(Pipelines {
+		depth_texture,
+
 		uniforms,
 		uniforms_group,
+
 		instances,
+
 		pipeline,
 	})
 }
@@ -357,6 +380,21 @@ fn frame_start(
 			.get_default_config(&ctx.adapter, size.x, size.y)
 			.expect("couldn't get surface config");
 		ctx.surface.configure(&ctx.device, &surface_config);
+
+		pipelines.depth_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+			label: Some("depth texture"),
+			size: wgpu::Extent3d {
+				width: size.x,
+				height: size.y,
+				depth_or_array_layers: 1,
+			},
+			mip_level_count: 1,
+			sample_count: 1,
+			dimension: wgpu::TextureDimension::D2,
+			format: wgpu::TextureFormat::Depth24Plus,
+			usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+			view_formats: &[],
+		});
 
 		let aspect = size.x as f32 / size.y as f32;
 		// TODO: configurable FOV
@@ -409,6 +447,9 @@ fn frame(
 	let texture_view = canvas_texture
 		.texture
 		.create_view(&wgpu::TextureViewDescriptor::default());
+	let depth_view = pipelines
+		.depth_texture
+		.create_view(&wgpu::TextureViewDescriptor::default());
 
 	let mut encoder = ctx
 		.device
@@ -424,6 +465,14 @@ fn frame(
 				store: wgpu::StoreOp::Store,
 			},
 		})],
+		depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+			view: &depth_view,
+			depth_ops: Some(wgpu::Operations {
+				load: wgpu::LoadOp::Clear(1.0),
+				store: wgpu::StoreOp::Store,
+			}),
+			stencil_ops: None,
+		}),
 		..default()
 	});
 	pass.set_pipeline(&pipelines.pipeline);
