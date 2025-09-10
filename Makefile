@@ -33,4 +33,4 @@ $(DIST_STATICS): dist/%: src/% dist
 
 .PHONY: test
 test:
-	cargo test --target=$(shell rustc -vV | grep host | cut -d' ' -f2)
+	cargo test --target=$(shell rustc -vV | grep host | cut -d' ' -f2) $(ARGS)

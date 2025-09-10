@@ -57,6 +57,47 @@ pub struct WindowResized(pub UVec2);
 #[derive(Clone, Copy, Debug, Component)]
 pub struct Camera;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub enum SpriteMode {
+	#[default]
+	Billboard,
+	Fixed,
+}
+
+#[derive(Clone, Debug, Component)]
+pub struct Sprite {
+	pub mode: SpriteMode,
+	pub size: Vec2,
+	// TODO: texture
+}
+
+impl Default for Sprite {
+	fn default() -> Self {
+		Self {
+			mode: default(),
+			size: Vec2::ONE,
+		}
+	}
+}
+
+#[derive(Default, Bundle)]
+pub struct SpriteBundle {
+	pub sprite: Sprite,
+	pub transform: Transform,
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SpriteInstance {
+	model: Mat4,
+	size: Vec2,
+	billboard: u32,
+	texture: u32, // TODO: currently only padding
+}
+
+#[derive(Resource, Default)]
+struct SpriteInstanceCount(usize);
+
 thread_local! {
 	static PENDING_RESIZE: Cell<Option<UVec2>> =
 		panic!("trying to use PENDING_RESIZE from background thread");
@@ -127,6 +168,7 @@ fn setup(app: &mut App) -> crate::AsyncSetupResult<'_> {
 		};
 		app.insert_non_send_resource(setup_pipelines(&ctx).await?);
 		app.insert_non_send_resource(ctx);
+		app.init_resource::<SpriteInstanceCount>();
 
 		app.init_schedule(RenderPre);
 		app.init_schedule(Render);
@@ -188,37 +230,27 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 		}],
 	});
 
-	let instances = create_instances_buffer(ctx, 4);
-	// DEBUG
-	let instances_data = [
-		vec4(1.0, 1.0, 0.0, 0.0),
-		vec4(-1.0, 1.0, 0.0, 0.0),
-		vec4(1.0, 2.5, 0.0, 0.0),
-		vec4(-1.0, 2.5, 0.0, 0.0),
-	];
-	let instances_bytes = instances_data.map(|v| v.to_array());
-	let instances_bytes = bytemuck::cast_slice(&instances_bytes);
-	ctx.queue.write_buffer(&instances, 0, instances_bytes);
+	let instances = create_instances_buffer(ctx, size_of::<SpriteInstance>() * 64);
 
 	let shader_src = include_str!("shaders/quad.wgsl");
 	let shader_module = ctx
 		.device
 		.create_shader_module(wgpu::ShaderModuleDescriptor {
-			label: None,
+			label: Some("quad shader"),
 			source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_src)),
 		});
 
 	let pipeline_layout = ctx
 		.device
 		.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-			label: None,
+			label: Some("quad render layout"),
 			bind_group_layouts: &[&uniforms_layout],
 			push_constant_ranges: &[],
 		});
 	let pipeline = ctx
 		.device
 		.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-			label: None,
+			label: Some("quad render pipeline"),
 			layout: Some(&pipeline_layout),
 			depth_stencil: None,
 			multisample: wgpu::MultisampleState::default(),
@@ -226,6 +258,7 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 			cache: None,
 			primitive: wgpu::PrimitiveState {
 				topology: wgpu::PrimitiveTopology::TriangleStrip,
+				cull_mode: Some(wgpu::Face::Back),
 				..default()
 			},
 			vertex: wgpu::VertexState {
@@ -234,12 +267,34 @@ async fn setup_pipelines(ctx: &GraphicsContext) -> JsResult<Pipelines> {
 				entry_point: None,
 				buffers: &[wgpu::VertexBufferLayout {
 					step_mode: wgpu::VertexStepMode::Instance,
-					array_stride: size_of::<[f32; 4]>() as _,
-					attributes: &[wgpu::VertexAttribute {
-						shader_location: 0,
-						offset: 0,
-						format: wgpu::VertexFormat::Float32x4,
-					}],
+					array_stride: size_of::<SpriteInstance>() as _,
+					attributes: &[
+						wgpu::VertexAttribute {
+							shader_location: 0,
+							offset: size_of::<[Vec4; 0]>() as _,
+							format: wgpu::VertexFormat::Float32x4,
+						},
+						wgpu::VertexAttribute {
+							shader_location: 1,
+							offset: size_of::<[Vec4; 1]>() as _,
+							format: wgpu::VertexFormat::Float32x4,
+						},
+						wgpu::VertexAttribute {
+							shader_location: 2,
+							offset: size_of::<[Vec4; 2]>() as _,
+							format: wgpu::VertexFormat::Float32x4,
+						},
+						wgpu::VertexAttribute {
+							shader_location: 3,
+							offset: size_of::<[Vec4; 3]>() as _,
+							format: wgpu::VertexFormat::Float32x4,
+						},
+						wgpu::VertexAttribute {
+							shader_location: 4,
+							offset: size_of::<[Vec4; 4]>() as _,
+							format: wgpu::VertexFormat::Float32x4,
+						},
+					],
 				}],
 			},
 			fragment: Some(wgpu::FragmentState {
@@ -280,10 +335,15 @@ fn dispatch_resize(mut resize: EventWriter<WindowResized>, _: Option<NonSend<Non
 
 fn frame_start(
 	ctx: NonSend<GraphicsContext>,
-	pipelines: NonSend<Pipelines>,
+	mut pipelines: NonSendMut<Pipelines>,
 	time: Res<Time<Virtual>>,
+
 	mut resizes: EventReader<WindowResized>,
 	camera: Query<&Transform, (With<Camera>, Changed<Transform>)>,
+
+	sprites: Query<(&Transform, &Sprite)>,
+	mut instances: Local<Vec<SpriteInstance>>,
+	mut instance_count: ResMut<SpriteInstanceCount>,
 ) {
 	ctx.queue.write_buffer(
 		&pipelines.uniforms,
@@ -305,7 +365,6 @@ fn frame_start(
 		ctx.queue
 			.write_buffer(&pipelines.uniforms, 0, matrix_bytes(&projection));
 	}
-
 	if let Ok(transform) = camera.single() {
 		let view_mat = transform.as_view_matrix();
 		ctx.queue.write_buffer(
@@ -314,9 +373,35 @@ fn frame_start(
 			matrix_bytes(&view_mat),
 		);
 	}
+
+	let instances = &mut *instances;
+	instances.clear();
+	for (transform, sprite) in sprites.iter() {
+		let model = transform.as_model_matrix();
+		let size = sprite.size;
+		let billboard = matches!(sprite.mode, SpriteMode::Billboard) as u32;
+		instances.push(SpriteInstance {
+			model,
+			size,
+			billboard,
+			texture: 0,
+		});
+	}
+
+	instance_count.0 = instances.len();
+	let instances = bytemuck::cast_slice::<SpriteInstance, u8>(&instances);
+	if (pipelines.instances.size() as usize) < instances.len() {
+		pipelines.instances = create_instances_buffer(&ctx, instances.len());
+	}
+	ctx.queue.write_buffer(&pipelines.instances, 0, instances);
 }
 
-fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res<Time<Virtual>>) {
+fn frame(
+	ctx: NonSend<GraphicsContext>,
+	pipelines: NonSend<Pipelines>,
+	time: Res<Time<Virtual>>,
+	instance_count: Res<SpriteInstanceCount>,
+) {
 	let canvas_texture = ctx
 		.surface
 		.get_current_texture()
@@ -344,7 +429,7 @@ fn frame(ctx: NonSend<GraphicsContext>, pipelines: NonSend<Pipelines>, time: Res
 	pass.set_pipeline(&pipelines.pipeline);
 	pass.set_vertex_buffer(0, pipelines.instances.slice(..));
 	pass.set_bind_group(0, &pipelines.uniforms_group, &[]);
-	pass.draw(0 .. 4, 0 .. 4);
+	pass.draw(0 .. 4, 0 .. instance_count.0 as _);
 	drop(pass);
 
 	ctx.queue.submit([encoder.finish()]);

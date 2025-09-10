@@ -15,7 +15,19 @@ struct VIn {
 	vertex: u32,
 
 	@location(0)
-	position: vec4f,
+	model_0: vec4f,
+
+	@location(1)
+	model_1: vec4f,
+
+	@location(2)
+	model_2: vec4f,
+
+	@location(3)
+	model_3: vec4f,
+
+	@location(4)
+	size_etc: vec4f,
 }
 
 struct VOut {
@@ -32,19 +44,19 @@ fn vertex_main(in: VIn) -> VOut {
 	var uv: vec2f;
 	switch in.vertex {
 		case 0 {
-			vertex = vec4f(-0.5, 0.5, 0.0, 1.0);
+			vertex = vec4f(-0.5, 0.0, 0.5, 1.0);
 			uv = vec2f(0.0, 1.0);
 		}
 		case 1 {
-			vertex = vec4f(0.5, 0.5, 0.0, 1.0);
+			vertex = vec4f(0.5, 0.0, 0.5, 1.0);
 			uv = vec2f(1.0, 1.0);
 		}
 		case 2 {
-			vertex = vec4f(-0.5, -0.5, 0.0, 1.0);
+			vertex = vec4f(-0.5, 0.0, -0.5, 1.0);
 			uv = vec2f(0.0, 0.0);
 		}
 		case 3 {
-			vertex = vec4f(0.5, -0.5, 0.0, 1.0);
+			vertex = vec4f(0.5, 0.0, -0.5, 1.0);
 			uv = vec2f(1.0, 0.0);
 		}
 		default {
@@ -52,19 +64,13 @@ fn vertex_main(in: VIn) -> VOut {
 			uv = vec2f(0.5, 0.5);
 		}
 	}
-	let model = calc_model_matrix(in.position.xyz);
+	let size = in.size_etc.xy;
+	vertex = vertex * vec4f(size, 1.0, 1.0);
+	// TODO: billboard flag, texture
+	let model = mat4x4f(in.model_0, in.model_1, in.model_2, in.model_3);
 	return VOut(
 		uniforms.projection * uniforms.view * model * vertex,
 		uv,
-	);
-}
-
-fn calc_model_matrix(pos: vec3f) -> mat4x4f {
-	return mat4x4f(
-		vec4f(1.0, 0.0, 0.0, 0.0),
-		vec4f(0.0, 1.0, 0.0, 0.0),
-		vec4f(0.0, 0.0, 1.0, 0.0),
-		vec4f(pos, 1.0),
 	);
 }
 
